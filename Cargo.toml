@@ -1,0 +1,13 @@
+[package]
+name = "tcp-ip-stack"
+version = "0.1.0"
+edition = "2024"
+description = "Implementing a basic TCP/IP stack in rust"
+repository = "https://github.com/vighnesh-sawant/tcp-ip-stack"
+license = "MIT"
+
+[dependencies]
+dashmap = "6.1.0"
+etherparse = "0.19.0"
+mac_address = "1.1.8"
+tappers = "0.4.2"
