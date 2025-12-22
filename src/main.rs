@@ -7,7 +7,8 @@ use dashmap::DashMap;
 use etherparse::checksum::Sum16BitWords;
 use etherparse::{
     ArpHardwareId, ArpOperation, ArpPacket, ArpPacketSlice, EtherType, Ethernet2Slice,
-    IcmpEchoHeader, Icmpv4Slice, Icmpv4Type, IpNumber, Ipv4Slice, PacketBuilder,
+    IcmpEchoHeader, Icmpv4Slice, Icmpv4Type, IpNumber, Ipv4Slice, PacketBuilder, TcpHeader,
+    TcpSlice,
 };
 
 use mac_address::mac_address_by_name;
@@ -16,9 +17,21 @@ use tappers::{Interface, Tap};
 //too much effort making them structs
 type MacAddr = [u8; 6];
 type Ip4Addr = [u8; 4];
-
+type Port = u16;
 static MYIP: [u8; 4] = [10, 0, 0, 4];
 
+struct SendState {
+    nxt: u32,
+    una: u32,
+}
+struct RecvState {
+    nxt: u32,
+}
+
+struct TcpState {
+    send: SendState,
+    recv: RecvState,
+}
 fn main() {
     let tap_name = Interface::new("tap0").unwrap();
     let mut tap = Tap::new_named(tap_name).unwrap();
@@ -27,27 +40,31 @@ fn main() {
 
     let mut recv_buf = [0; 1514];
 
+    let mut tcp_state: Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>> =
+        Arc::new(RwLock::new(DashMap::new()));
     let mut arp_table: Arc<RwLock<DashMap<Ip4Addr, MacAddr>>> =
         Arc::new(RwLock::new(DashMap::new()));
 
     loop {
         tap.recv(&mut recv_buf).unwrap();
-        handle_frame(&recv_buf, &mut arp_table, &mut tap).ok();
+        handle_frame(&recv_buf, &mut arp_table, &mut tcp_state, &mut tap).ok();
     }
 }
 
 fn handle_frame(
     buf: &[u8],
     arp_table: &mut Arc<RwLock<DashMap<Ip4Addr, MacAddr>>>,
+    tcp_state: &mut Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>>,
     tap: &mut Tap,
 ) -> Result<(), Box<dyn error::Error>> {
     let frame = Ethernet2Slice::from_slice_without_fcs(buf)?;
 
     match frame.ether_type() {
         EtherType::ARP => handle_arp(frame.payload_slice(), arp_table, tap)?,
-        EtherType::IPV4 => handle_ipv4(frame.payload_slice(), arp_table, tap, &frame.source())?,
+        EtherType::IPV4 => handle_ipv4(frame.payload_slice(), tcp_state, tap, &frame.source())?,
         _ => println!("Aint handling this yet {:?}", frame.ether_type()),
     }
+
     Ok(())
 }
 #[allow(clippy::collapsible_if)] //prefer writing my ifs like this 
@@ -65,8 +82,10 @@ fn handle_arp(
                 packet.sender_protocol_addr().try_into()?,
                 packet.sender_hw_addr().try_into()?,
             );
+
             // this causes panic because tap0 is not there how is that possible?
             let mymac = mac_address_by_name("tap0").unwrap().unwrap().bytes();
+
             if packet.target_protocol_addr() == MYIP {
                 if packet.operation() == ArpOperation::REQUEST {
                     let reply = ArpPacket::new(
@@ -87,6 +106,7 @@ fn handle_arp(
                     .arp(reply);
                     let mut result = Vec::<u8>::with_capacity(builder.size());
                     builder.write(&mut result)?;
+
                     tap.send(&result)?;
                 }
             }
@@ -97,20 +117,24 @@ fn handle_arp(
 
 fn handle_ipv4(
     buf: &[u8],
-    arp_table: &mut Arc<RwLock<DashMap<Ip4Addr, MacAddr>>>,
+    tcp_state: &mut Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>>,
     tap: &mut Tap,
     src_mac: &[u8; 6],
 ) -> Result<(), Box<dyn error::Error>> {
     let packet = Ipv4Slice::from_slice(buf)?;
     let header = packet.header();
+
     let csm = Sum16BitWords::new().add_slice(header.slice());
     if csm.ones_complement() == 0 {
         if header.destination() == MYIP {
             match header.protocol() {
                 //ignoring fragmentation currently
-                IpNumber::ICMP => handle_icmpv4(
+                IpNumber::ICMP => {
+                    handle_icmpv4(packet.payload().payload, tap, header.source(), src_mac)?
+                }
+                IpNumber::TCP => handle_tcp(
                     packet.payload().payload,
-                    arp_table,
+                    tcp_state,
                     tap,
                     header.source(),
                     src_mac,
@@ -129,42 +153,63 @@ fn handle_ipv4(
     Ok(())
 }
 
+fn handle_tcp(
+    buf: &[u8],
+    tcp_state: &mut Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>>,
+    tap: &mut Tap,
+    srcip: [u8; 4],
+    src_mac: &[u8; 6],
+) -> Result<(), Box<dyn error::Error>> {
+    let packet = TcpSlice::from_slice(buf)?;
+    let mut tcp_header = TcpHeader::new(packet.destination_port(), packet.source_port(), 300, 4000);
+    tcp_header.syn = true;
+    tcp_header.ack = true;
+    tcp_header.acknowledgment_number = packet.sequence_number() + 1;
+    let mymac = mac_address_by_name("tap0").unwrap().unwrap().bytes();
+    let builder = PacketBuilder::ethernet2(mymac, *src_mac)
+        .ipv4(MYIP, srcip, 64)
+        .tcp_header(tcp_header);
+    let payload = packet.payload();
+    let mut result = Vec::<u8>::with_capacity(builder.size(payload.len()));
+    builder.write(&mut result, payload)?;
+    tap.send(&result)?;
+
+    Ok(())
+}
+
 fn handle_icmpv4(
     buf: &[u8],
-    arp_table: &mut Arc<RwLock<DashMap<Ip4Addr, MacAddr>>>,
     tap: &mut Tap,
     srcip: [u8; 4],
     src_mac: &[u8; 6],
 ) -> Result<(), Box<dyn error::Error>> {
     let packet = Icmpv4Slice::from_slice(buf)?;
+
     match packet.icmp_type() {
-        Icmpv4Type::EchoRequest(icmp_echo_header) => handle_icmpv4_echo_request(
-            icmp_echo_header,
-            packet.payload(),
-            arp_table,
-            tap,
-            srcip,
-            src_mac,
-        )?,
+        Icmpv4Type::EchoRequest(icmp_echo_header) => {
+            handle_icmpv4_echo_request(icmp_echo_header, packet.payload(), tap, srcip, src_mac)?
+        }
         _ => println!("Aint handling this yet"),
     }
+
     Ok(())
 }
 
 fn handle_icmpv4_echo_request(
     header: IcmpEchoHeader,
     payload: &[u8],
-    arp_table: &mut Arc<RwLock<DashMap<Ip4Addr, MacAddr>>>,
     tap: &mut Tap,
     srcip: [u8; 4],
     src_mac: &[u8; 6],
 ) -> Result<(), Box<dyn error::Error>> {
     let mymac = mac_address_by_name("tap0").unwrap().unwrap().bytes();
+
     let builder = PacketBuilder::ethernet2(mymac, *src_mac)
         .ipv4(MYIP, srcip, 64)
         .icmpv4(Icmpv4Type::EchoReply(header));
     let mut result = Vec::<u8>::with_capacity(builder.size(payload.len()));
     builder.write(&mut result, payload)?;
+
     tap.send(&result)?;
 
     Ok(())
