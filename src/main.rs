@@ -164,33 +164,42 @@ fn handle_tcp(
 ) -> Result<(), Box<dyn error::Error>> {
     let packet = TcpSlice::from_slice(buf)?;
     if packet.syn() {
-        handle_tcp_syn(buf, tcp_state, tap, srcip, src_mac)?;
-    } else {
-        // does not handle reordering of packets currently
-        let table = tcp_state.read().unwrap();
-        if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
-            if packet.sequence_number() == tcp.recv.nxt {
-                if packet.ack() {
-                    tcp.send.una = packet.acknowledgment_number();
-                }
-                if !packet.payload().is_empty() {
-                    tcp.recv.nxt += packet.payload().len() as u32;
-                    let mut tcp_header = TcpHeader::new(
-                        packet.destination_port(),
-                        packet.source_port(),
-                        tcp.send.nxt,
-                        64553,
-                    );
-                    tcp_header.ack = true;
-                    tcp_header.acknowledgment_number = tcp.recv.nxt;
-                    let payload: &[u8] = &[0x32, 0x34, 0x0a];
-                    tcp.send.nxt += payload.len() as u32;
-
-                    send_tcp(srcip, src_mac, tcp_header, payload, tap)?;
-
-                    println!("Received {:?}", packet.payload());
-                }
+        handle_tcp_syn(&packet, tcp_state, tap, srcip, src_mac)?;
+        return Ok(());
+    }
+    let table = tcp_state.read().unwrap();
+    if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
+        if packet.sequence_number() == tcp.recv.nxt {
+            if packet.ack() {
+                tcp.send.una = packet.acknowledgment_number();
             }
+            if !packet.payload().is_empty() {
+                let payload: &[u8] = &[0x32, 0x34, 0x0a];
+                tcp_send_ack(&packet, tcp.value_mut(), tap, src_mac, srcip, payload)?;
+            }
+        }
+    } else {
+        println!("something is wrong wuith the tcp state machine");
+    }
+
+    if packet.fin() {
+        if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
+            tcp.recv.nxt += 1;
+
+            let payload: &[u8] = &[];
+            tcp_send_ack(&packet, tcp.value_mut(), tap, src_mac, srcip, payload)?;
+            let mut tcp_header = TcpHeader::new(
+                packet.destination_port(),
+                packet.source_port(),
+                tcp.send.nxt,
+                64553,
+            );
+            tcp_header.ack = true;
+            tcp_header.fin = true;
+            tcp_header.acknowledgment_number = tcp.recv.nxt;
+            tcp.send.nxt += payload.len() as u32;
+
+            send_tcp(srcip, src_mac, tcp_header, payload, tap)?;
         } else {
             println!("Something is wrong wuith the tcp state machine");
         }
@@ -198,15 +207,39 @@ fn handle_tcp(
     Ok(())
 }
 
+// does not handle reordering of packets currently
+fn tcp_send_ack(
+    packet: &TcpSlice,
+    tcp: &mut TcpState,
+    tap: &mut Tap,
+    src_mac: &[u8; 6],
+    srcip: [u8; 4],
+    payload: &[u8],
+) -> Result<(), Box<dyn error::Error>> {
+    tcp.recv.nxt += packet.payload().len() as u32;
+    let mut tcp_header = TcpHeader::new(
+        packet.destination_port(),
+        packet.source_port(),
+        tcp.send.nxt,
+        64553,
+    );
+    tcp_header.ack = true;
+    tcp_header.acknowledgment_number = tcp.recv.nxt;
+    tcp.send.nxt += payload.len() as u32;
+
+    send_tcp(srcip, src_mac, tcp_header, payload, tap)?;
+
+    println!("Received {:?}", packet.payload());
+    Ok(())
+}
 fn handle_tcp_syn(
-    buf: &[u8],
+    packet: &TcpSlice,
     tcp_state: &mut Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>>,
     tap: &mut Tap,
     srcip: [u8; 4],
     src_mac: &[u8; 6],
 ) -> Result<(), Box<dyn error::Error>> {
     let table = tcp_state.write().unwrap();
-    let packet = TcpSlice::from_slice(buf)?;
     let mut rng = rand::rng();
     let isn: u32 = rng.random();
     table
