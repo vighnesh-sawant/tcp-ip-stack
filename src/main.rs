@@ -12,6 +12,7 @@ use etherparse::{
 };
 
 use mac_address::mac_address_by_name;
+use rand::Rng;
 use tappers::{Interface, Tap};
 
 //too much effort making them structs
@@ -32,6 +33,7 @@ struct TcpState {
     send: SendState,
     recv: RecvState,
 }
+
 fn main() {
     let tap_name = Interface::new("tap0").unwrap();
     let mut tap = Tap::new_named(tap_name).unwrap();
@@ -161,15 +163,86 @@ fn handle_tcp(
     src_mac: &[u8; 6],
 ) -> Result<(), Box<dyn error::Error>> {
     let packet = TcpSlice::from_slice(buf)?;
-    let mut tcp_header = TcpHeader::new(packet.destination_port(), packet.source_port(), 300, 4000);
+    if packet.syn() {
+        handle_tcp_syn(buf, tcp_state, tap, srcip, src_mac)?;
+    } else {
+        // does not handle reordering of packets currently
+        let table = tcp_state.read().unwrap();
+        if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
+            if packet.sequence_number() == tcp.recv.nxt {
+                if packet.ack() {
+                    tcp.send.una = packet.acknowledgment_number();
+                }
+                if !packet.payload().is_empty() {
+                    tcp.recv.nxt += packet.payload().len() as u32;
+                    let mut tcp_header = TcpHeader::new(
+                        packet.destination_port(),
+                        packet.source_port(),
+                        tcp.send.nxt,
+                        64553,
+                    );
+                    tcp_header.ack = true;
+                    tcp_header.acknowledgment_number = tcp.recv.nxt;
+                    let payload: &[u8] = &[0x32, 0x34, 0x0a];
+                    tcp.send.nxt += payload.len() as u32;
+
+                    send_tcp(srcip, src_mac, tcp_header, payload, tap)?;
+
+                    println!("Received {:?}", packet.payload());
+                }
+            }
+        } else {
+            println!("Something is wrong wuith the tcp state machine");
+        }
+    }
+    Ok(())
+}
+
+fn handle_tcp_syn(
+    buf: &[u8],
+    tcp_state: &mut Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>>,
+    tap: &mut Tap,
+    srcip: [u8; 4],
+    src_mac: &[u8; 6],
+) -> Result<(), Box<dyn error::Error>> {
+    let table = tcp_state.write().unwrap();
+    let packet = TcpSlice::from_slice(buf)?;
+    let mut rng = rand::rng();
+    let isn: u32 = rng.random();
+    table
+        .entry((srcip, packet.source_port()))
+        .and_modify(|tcp_state| tcp_state.recv.nxt = packet.sequence_number())
+        .or_insert(TcpState {
+            send: SendState {
+                nxt: isn + 1,
+                una: isn,
+            },
+            recv: RecvState {
+                nxt: packet.sequence_number() + 1,
+            },
+        });
+    let mut tcp_header =
+        TcpHeader::new(packet.destination_port(), packet.source_port(), isn, 64553);
     tcp_header.syn = true;
     tcp_header.ack = true;
     tcp_header.acknowledgment_number = packet.sequence_number() + 1;
+
+    let payload: &[u8] = &[];
+    send_tcp(srcip, src_mac, tcp_header, payload, tap)?;
+    Ok(())
+}
+
+fn send_tcp(
+    srcip: [u8; 4],
+    src_mac: &[u8; 6],
+    tcp_header: TcpHeader,
+    payload: &[u8],
+    tap: &mut Tap,
+) -> Result<(), Box<dyn error::Error>> {
     let mymac = mac_address_by_name("tap0").unwrap().unwrap().bytes();
     let builder = PacketBuilder::ethernet2(mymac, *src_mac)
         .ipv4(MYIP, srcip, 64)
         .tcp_header(tcp_header);
-    let payload = packet.payload();
     let mut result = Vec::<u8>::with_capacity(builder.size(payload.len()));
     builder.write(&mut result, payload)?;
     tap.send(&result)?;
