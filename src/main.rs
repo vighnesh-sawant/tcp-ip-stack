@@ -1,5 +1,6 @@
 use std::error;
 use std::net::Ipv4Addr;
+use std::ops::DerefMut;
 use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
@@ -21,6 +22,11 @@ type Ip4Addr = [u8; 4];
 type Port = u16;
 static MYIP: [u8; 4] = [10, 0, 0, 4];
 
+enum TcpStates {
+    InProgress,
+    Established,
+    Closing,
+}
 struct SendState {
     nxt: u32,
     una: u32,
@@ -32,6 +38,7 @@ struct RecvState {
 struct TcpState {
     send: SendState,
     recv: RecvState,
+    state: TcpStates,
 }
 
 fn main() {
@@ -163,15 +170,30 @@ fn handle_tcp(
     src_mac: &[u8; 6],
 ) -> Result<(), Box<dyn error::Error>> {
     let packet = TcpSlice::from_slice(buf)?;
+    // the rfc tells we need to validate this rst so we need to do this
+    if packet.rst() {
+        let table = tcp_state.write().unwrap();
+        table.remove(&(srcip, packet.source_port()));
+        return Ok(());
+    }
     if packet.syn() {
         handle_tcp_syn(&packet, tcp_state, tap, srcip, src_mac)?;
         return Ok(());
     }
-    let table = tcp_state.read().unwrap();
+
+    let table = tcp_state.write().unwrap();
     if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
         if packet.sequence_number() == tcp.recv.nxt {
             if packet.ack() {
                 tcp.send.una = packet.acknowledgment_number();
+                match tcp.state {
+                    TcpStates::InProgress => tcp.state = TcpStates::Established,
+                    TcpStates::Closing => {
+                        tcp.deref_mut();
+                        table.remove(tcp.key());
+                    }
+                    TcpStates::Established => {}
+                }
             }
             if !packet.payload().is_empty() {
                 let payload: &[u8] = &[0x32, 0x34, 0x0a];
@@ -198,7 +220,7 @@ fn handle_tcp(
             tcp_header.fin = true;
             tcp_header.acknowledgment_number = tcp.recv.nxt;
             tcp.send.nxt += payload.len() as u32;
-
+            tcp.state = TcpStates::Closing;
             send_tcp(srcip, src_mac, tcp_header, payload, tap)?;
         } else {
             println!("Something is wrong wuith the tcp state machine");
@@ -253,10 +275,20 @@ fn handle_tcp_syn(
             recv: RecvState {
                 nxt: packet.sequence_number() + 1,
             },
+            state: TcpStates::InProgress,
         });
     let mut tcp_header =
         TcpHeader::new(packet.destination_port(), packet.source_port(), isn, 64553);
-    tcp_header.syn = true;
+    if packet.ack() {
+        if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
+            tcp.send.una = packet.acknowledgment_number();
+            if let TcpStates::InProgress = tcp.state {
+                tcp.state = TcpStates::Established;
+            }
+        }
+    } else {
+        tcp_header.syn = true;
+    }
     tcp_header.ack = true;
     tcp_header.acknowledgment_number = packet.sequence_number() + 1;
 
