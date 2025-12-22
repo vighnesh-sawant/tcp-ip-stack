@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error;
 use std::net::Ipv4Addr;
 use std::ops::DerefMut;
@@ -20,27 +21,43 @@ use tappers::{Interface, Tap};
 type MacAddr = [u8; 6];
 type Ip4Addr = [u8; 4];
 type Port = u16;
-static MYIP: [u8; 4] = [10, 0, 0, 4];
+const MYIP: [u8; 4] = [10, 0, 0, 4];
 
+#[allow(unused)]
+#[derive(Copy, Clone, Debug)]
+enum ClosingTcp {
+    Rx,
+    Tx,
+    RxAndTx,
+}
+#[derive(Debug)]
 enum TcpStates {
     InProgress,
     Established,
-    Closing,
+    ClosingTcp(ClosingTcp),
 }
+
+#[allow(unused)]
 struct SendState {
     nxt: u32,
     una: u32,
+    win: u16,
 }
+
+#[allow(unused)]
 struct RecvState {
     nxt: u32,
+    win: u16,
 }
 
 struct TcpState {
     send: SendState,
     recv: RecvState,
     state: TcpStates,
+    buffer: BTreeMap<u32, [u8; 1514]>,
 }
 
+//we have hardcoded window size currently
 fn main() {
     let tap_name = Interface::new("tap0").unwrap();
     let mut tap = Tap::new_named(tap_name).unwrap();
@@ -170,7 +187,7 @@ fn handle_tcp(
     src_mac: &[u8; 6],
 ) -> Result<(), Box<dyn error::Error>> {
     let packet = TcpSlice::from_slice(buf)?;
-    // the rfc tells we need to validate this rst so we need to do this
+    // the rfc tells we need to validate this rst so we need to do that
     if packet.rst() {
         let table = tcp_state.write().unwrap();
         table.remove(&(srcip, packet.source_port()));
@@ -182,46 +199,75 @@ fn handle_tcp(
     }
 
     let table = tcp_state.write().unwrap();
+    let mut next_packet_buf: Option<[u8; 1514]> = None;
     if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
         if packet.sequence_number() == tcp.recv.nxt {
             if packet.ack() {
                 tcp.send.una = packet.acknowledgment_number();
+
                 match tcp.state {
                     TcpStates::InProgress => tcp.state = TcpStates::Established,
-                    TcpStates::Closing => {
-                        tcp.deref_mut();
-                        table.remove(tcp.key());
+                    TcpStates::ClosingTcp(ClosingTcp::RxAndTx) => {
+                        drop(tcp);
+                        table.remove(&(srcip, packet.source_port()));
+                        return Ok(());
                     }
-                    TcpStates::Established => {}
+                    _ => {}
                 }
             }
             if !packet.payload().is_empty() {
                 let payload: &[u8] = &[0x32, 0x34, 0x0a];
                 tcp_send_ack(&packet, tcp.value_mut(), tap, src_mac, srcip, payload)?;
             }
+            let next = &tcp.recv.nxt.clone();
+            next_packet_buf = tcp.buffer.remove(next);
+
+            //this does not handle overlaps currently
+        } else if (packet.sequence_number() + packet.payload().len() as u32 - 1)
+            <= tcp.recv.nxt + 64240
+        {
+            tcp.buffer
+                .insert(packet.sequence_number(), buf.try_into().unwrap());
+            let payload: &[u8] = &[];
+            tcp_send_ack(&packet, tcp.value_mut(), tap, src_mac, srcip, payload)?;
         }
     } else {
         println!("something is wrong wuith the tcp state machine");
     }
-
+    drop(table);
+    if let Some(buff) = next_packet_buf {
+        handle_tcp(&buff, tcp_state, tap, srcip, src_mac)?;
+    }
     if packet.fin() {
+        let table = tcp_state.write().unwrap();
         if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
-            tcp.recv.nxt += 1;
-
+            tcp.recv.nxt = packet.sequence_number() + 1;
             let payload: &[u8] = &[];
             tcp_send_ack(&packet, tcp.value_mut(), tap, src_mac, srcip, payload)?;
-            let mut tcp_header = TcpHeader::new(
-                packet.destination_port(),
-                packet.source_port(),
-                tcp.send.nxt,
-                64553,
-            );
-            tcp_header.ack = true;
-            tcp_header.fin = true;
-            tcp_header.acknowledgment_number = tcp.recv.nxt;
-            tcp.send.nxt += payload.len() as u32;
-            tcp.state = TcpStates::Closing;
-            send_tcp(srcip, src_mac, tcp_header, payload, tap)?;
+
+            match tcp.state {
+                TcpStates::ClosingTcp(ClosingTcp::Tx) => {
+                    tcp.state = TcpStates::ClosingTcp(ClosingTcp::RxAndTx);
+                    tcp.deref_mut();
+                    table.remove(tcp.key());
+                }
+
+                _ => tcp.state = TcpStates::ClosingTcp(ClosingTcp::Rx),
+            }
+            if let TcpStates::ClosingTcp(ClosingTcp::Rx) = tcp.state {
+                let mut tcp_header = TcpHeader::new(
+                    packet.destination_port(),
+                    packet.source_port(),
+                    tcp.send.nxt,
+                    64240,
+                );
+                tcp_header.ack = true;
+                tcp_header.fin = true;
+                tcp_header.acknowledgment_number = tcp.recv.nxt;
+                tcp.send.nxt += payload.len() as u32;
+                tcp.state = TcpStates::ClosingTcp(ClosingTcp::RxAndTx);
+                send_tcp(srcip, src_mac, tcp_header, payload, tap)?;
+            }
         } else {
             println!("Something is wrong wuith the tcp state machine");
         }
@@ -243,7 +289,7 @@ fn tcp_send_ack(
         packet.destination_port(),
         packet.source_port(),
         tcp.send.nxt,
-        64553,
+        64240,
     );
     tcp_header.ack = true;
     tcp_header.acknowledgment_number = tcp.recv.nxt;
@@ -271,14 +317,17 @@ fn handle_tcp_syn(
             send: SendState {
                 nxt: isn + 1,
                 una: isn,
+                win: packet.window_size(),
             },
             recv: RecvState {
                 nxt: packet.sequence_number() + 1,
+                win: 64240,
             },
             state: TcpStates::InProgress,
+            buffer: BTreeMap::new(),
         });
     let mut tcp_header =
-        TcpHeader::new(packet.destination_port(), packet.source_port(), isn, 64553);
+        TcpHeader::new(packet.destination_port(), packet.source_port(), isn, 64240);
     if packet.ack() {
         if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
             tcp.send.una = packet.acknowledgment_number();
