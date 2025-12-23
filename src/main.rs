@@ -23,7 +23,7 @@ type Ip4Addr = [u8; 4];
 type Port = u16;
 const MYIP: [u8; 4] = [10, 0, 0, 4];
 
-#[allow(unused)]
+#[allow(unused)] //this is for tx we dont use it yet but we need it
 #[derive(Copy, Clone, Debug)]
 enum ClosingTcp {
     Rx,
@@ -37,24 +37,23 @@ enum TcpStates {
     ClosingTcp(ClosingTcp),
 }
 
-#[allow(unused)]
 struct SendState {
     nxt: u32,
     una: u32,
     win: u16,
+    buffer: BTreeMap<u32, Box<[u8]>>,
 }
 
-#[allow(unused)]
 struct RecvState {
     nxt: u32,
     win: u16,
+    buffer: BTreeMap<u32, [u8; 1514]>,
 }
 
 struct TcpState {
     send: SendState,
     recv: RecvState,
     state: TcpStates,
-    buffer: BTreeMap<u32, [u8; 1514]>,
 }
 
 //we have hardcoded window size currently
@@ -204,7 +203,7 @@ fn handle_tcp(
         if packet.sequence_number() == tcp.recv.nxt {
             if packet.ack() {
                 tcp.send.una = packet.acknowledgment_number();
-
+                tcp.send.buffer.remove(&packet.acknowledgment_number());
                 match tcp.state {
                     TcpStates::InProgress => tcp.state = TcpStates::Established,
                     TcpStates::ClosingTcp(ClosingTcp::RxAndTx) => {
@@ -220,13 +219,14 @@ fn handle_tcp(
                 tcp_send_ack(&packet, tcp.value_mut(), tap, src_mac, srcip, payload)?;
             }
             let next = &tcp.recv.nxt.clone();
-            next_packet_buf = tcp.buffer.remove(next);
+            next_packet_buf = tcp.recv.buffer.remove(next);
 
             //this does not handle overlaps currently
         } else if (packet.sequence_number() + packet.payload().len() as u32 - 1)
-            <= tcp.recv.nxt + 64240
+            <= tcp.recv.nxt + tcp.recv.win as u32
         {
-            tcp.buffer
+            tcp.recv
+                .buffer
                 .insert(packet.sequence_number(), buf.try_into().unwrap());
             let payload: &[u8] = &[];
             tcp_send_ack(&packet, tcp.value_mut(), tap, src_mac, srcip, payload)?;
@@ -259,14 +259,14 @@ fn handle_tcp(
                     packet.destination_port(),
                     packet.source_port(),
                     tcp.send.nxt,
-                    64240,
+                    tcp.recv.win,
                 );
                 tcp_header.ack = true;
                 tcp_header.fin = true;
                 tcp_header.acknowledgment_number = tcp.recv.nxt;
                 tcp.send.nxt += payload.len() as u32;
                 tcp.state = TcpStates::ClosingTcp(ClosingTcp::RxAndTx);
-                send_tcp(srcip, src_mac, tcp_header, payload, tap)?;
+                send_tcp(srcip, src_mac, tcp.value_mut(), tcp_header, payload, tap)?;
             }
         } else {
             println!("Something is wrong wuith the tcp state machine");
@@ -289,13 +289,13 @@ fn tcp_send_ack(
         packet.destination_port(),
         packet.source_port(),
         tcp.send.nxt,
-        64240,
+        tcp.recv.win,
     );
     tcp_header.ack = true;
     tcp_header.acknowledgment_number = tcp.recv.nxt;
     tcp.send.nxt += payload.len() as u32;
 
-    send_tcp(srcip, src_mac, tcp_header, payload, tap)?;
+    send_tcp(srcip, src_mac, tcp, tcp_header, payload, tap)?;
 
     println!("Received {:?}", packet.payload());
     Ok(())
@@ -318,13 +318,14 @@ fn handle_tcp_syn(
                 nxt: isn + 1,
                 una: isn,
                 win: packet.window_size(),
+                buffer: BTreeMap::new(),
             },
             recv: RecvState {
                 nxt: packet.sequence_number() + 1,
                 win: 64240,
+                buffer: BTreeMap::new(),
             },
             state: TcpStates::InProgress,
-            buffer: BTreeMap::new(),
         });
     let mut tcp_header =
         TcpHeader::new(packet.destination_port(), packet.source_port(), isn, 64240);
@@ -342,24 +343,35 @@ fn handle_tcp_syn(
     tcp_header.acknowledgment_number = packet.sequence_number() + 1;
 
     let payload: &[u8] = &[];
-    send_tcp(srcip, src_mac, tcp_header, payload, tap)?;
+    if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
+        send_tcp(srcip, src_mac, tcp.value_mut(), tcp_header, payload, tap)?;
+    }
     Ok(())
 }
 
 fn send_tcp(
     srcip: [u8; 4],
     src_mac: &[u8; 6],
+    tcp: &mut TcpState,
     tcp_header: TcpHeader,
     payload: &[u8],
     tap: &mut Tap,
 ) -> Result<(), Box<dyn error::Error>> {
     let mymac = mac_address_by_name("tap0").unwrap().unwrap().bytes();
+    let seq_num = tcp_header.sequence_number;
+
     let builder = PacketBuilder::ethernet2(mymac, *src_mac)
         .ipv4(MYIP, srcip, 64)
         .tcp_header(tcp_header);
     let mut result = Vec::<u8>::with_capacity(builder.size(payload.len()));
     builder.write(&mut result, payload)?;
-    tap.send(&result)?;
+    tcp.send
+        .buffer
+        .insert(seq_num + payload.len() as u32, Box::from(result.as_slice()));
+    //i think this not exactly according to rfc but think this will give better performance?
+    if tcp.send.una + tcp.send.win as u32 >= seq_num {
+        tap.send(&result)?;
+    }
 
     Ok(())
 }
