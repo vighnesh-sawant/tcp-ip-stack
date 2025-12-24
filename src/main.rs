@@ -1,9 +1,10 @@
+use std::cmp::max;
 use std::collections::BTreeMap;
 use std::error;
 use std::net::Ipv4Addr;
 use std::ops::DerefMut;
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Instant;
+use std::time::Duration;
 
 use dashmap::DashMap;
 
@@ -17,6 +18,8 @@ use etherparse::{
 use mac_address::mac_address_by_name;
 use rand::Rng;
 use tappers::{Interface, Tap};
+use tokio::sync::watch;
+use tokio::time::{self, Instant};
 
 //too much effort making them structs
 type MacAddr = [u8; 6];
@@ -24,7 +27,8 @@ type Ip4Addr = [u8; 4];
 type Port = u16;
 const MYIP: [u8; 4] = [10, 0, 0, 4];
 
-static START_TIME: OnceLock<Instant> = OnceLock::new();
+const INFTIME: u64 = 365 * 24 * 3600;
+static TIMER: OnceLock<Instant> = OnceLock::new();
 
 #[allow(unused)] //this is for tx we dont use it yet but we need it
 #[derive(Copy, Clone, Debug)]
@@ -44,9 +48,10 @@ struct SendState {
     nxt: u32,
     una: u32,
     win: u16,
-    srtt: u16,
-    rttvar: u16,
-    rto: u16,
+    srtt: u32,
+    rttvar: u32,
+    rto: u32,
+    tx: watch::Sender<Duration>,
     buffer: BTreeMap<u32, Box<[u8]>>,
 }
 
@@ -63,13 +68,15 @@ struct TcpState {
 }
 
 //we have hardcoded window size currently
-fn main() {
+
+#[tokio::main]
+async fn main() {
     let tap_name = Interface::new("tap0").unwrap();
     let mut tap = Tap::new_named(tap_name).unwrap();
     tap.add_addr(Ipv4Addr::new(10, 0, 0, 1)).unwrap();
     tap.set_up().unwrap();
 
-    START_TIME.get_or_init(Instant::now);
+    TIMER.get_or_init(Instant::now);
 
     let mut recv_buf = [0; 1514];
 
@@ -271,7 +278,7 @@ fn handle_tcp(
                 );
                 tcp_header.ack = true;
 
-                handle_timestamp_option(&packet, &mut tcp_header)?;
+                handle_timestamp_option(&packet, &mut tcp_header, tcp.value_mut())?;
 
                 tcp_header.fin = true;
                 tcp_header.acknowledgment_number = tcp.recv.nxt;
@@ -306,7 +313,7 @@ fn tcp_send_ack(
     tcp_header.acknowledgment_number = tcp.recv.nxt;
     tcp.send.nxt += payload.len() as u32;
 
-    handle_timestamp_option(packet, &mut tcp_header)?;
+    handle_timestamp_option(packet, &mut tcp_header, tcp)?;
 
     send_tcp(srcip, src_mac, tcp, tcp_header, payload, tap)?;
 
@@ -324,9 +331,33 @@ fn handle_tcp_syn(
     let table = tcp_state.write().unwrap();
     let mut rng = rand::rng();
     let isn: u32 = rng.random();
+
+    let (tx, mut rx): (watch::Sender<Duration>, watch::Receiver<Duration>) =
+        watch::channel(Duration::from_secs(INFTIME));
+
+    if !table.contains_key(&(srcip, packet.source_port())) {
+        tokio::spawn(async move {
+            let timer = time::sleep_until(Instant::now() + Duration::from_secs(INFTIME));
+            tokio::pin!(timer);
+            loop {
+                tokio::select! {
+                    msg = rx.changed() => {
+                        if let Ok(()) = msg {
+                        timer.as_mut().reset(Instant::now() + *rx.borrow_and_update());
+                        }
+                    }
+
+                    _ = &mut timer => {
+                        println!("INTERRUPT: 5 seconds passed without a message!");
+                    }
+                }
+            }
+        });
+    }
+
     table
         .entry((srcip, packet.source_port()))
-        .and_modify(|tcp_state| tcp_state.recv.nxt = packet.sequence_number())
+        .and_modify(|tcp_state| tcp_state.recv.nxt = packet.sequence_number() + 1)
         .or_insert(TcpState {
             send: SendState {
                 nxt: isn + 1,
@@ -335,6 +366,7 @@ fn handle_tcp_syn(
                 srtt: 0,
                 rttvar: 0,
                 rto: 1000,
+                tx,
                 buffer: BTreeMap::new(),
             },
             recv: RecvState {
@@ -344,6 +376,7 @@ fn handle_tcp_syn(
             },
             state: TcpStates::InProgress,
         });
+
     let mut tcp_header =
         TcpHeader::new(packet.destination_port(), packet.source_port(), isn, 64240);
     if packet.ack() {
@@ -359,10 +392,9 @@ fn handle_tcp_syn(
     tcp_header.ack = true;
     tcp_header.acknowledgment_number = packet.sequence_number() + 1;
 
-    handle_timestamp_option(packet, &mut tcp_header)?;
-
     let payload: &[u8] = &[];
     if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
+        handle_timestamp_option(packet, &mut tcp_header, tcp.value_mut())?;
         send_tcp(srcip, src_mac, tcp.value_mut(), tcp_header, payload, tap)?;
     }
     Ok(())
@@ -371,18 +403,35 @@ fn handle_tcp_syn(
 fn handle_timestamp_option(
     packet: &TcpSlice,
     tcp_header: &mut TcpHeader,
+    tcp: &mut TcpState,
 ) -> Result<(), Box<dyn error::Error>> {
     for options in packet.options_iterator() {
         if let TcpOptionElement::Timestamp(tsval, tsecr) = options.unwrap() {
+            let curr_time = TIMER.get_or_init(Instant::now).elapsed().as_millis() as u32;
             let elements = [
                 TcpOptionElement::Noop,
                 TcpOptionElement::Noop,
-                TcpOptionElement::Timestamp(
-                    START_TIME.get_or_init(Instant::now).elapsed().as_millis() as u32,
-                    tsval,
-                ),
+                TcpOptionElement::Timestamp(curr_time, tsval),
             ];
             tcp_header.set_options(&elements)?;
+            if tsecr != 0 {
+                let r = curr_time - tsecr;
+                if r > 0 {
+                    if tcp.send.srtt == 0 {
+                        tcp.send.srtt = r;
+                        tcp.send.rttvar = r / 2;
+                        tcp.send.rto = tcp.send.srtt + max(1000, 4 * tcp.send.rttvar);
+                    } else {
+                        let alpha = 125;
+                        let beta = 250;
+                        tcp.send.rttvar = ((1000 - beta) * tcp.send.rttvar
+                            + beta * (tcp.send.srtt.abs_diff(r)))
+                            / 1000;
+                        tcp.send.srtt = ((1000 - alpha) * tcp.send.srtt + alpha * r) / 1000;
+                        tcp.send.rto = tcp.send.srtt + max(1000, 4 * tcp.send.rttvar);
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -398,7 +447,11 @@ fn send_tcp(
 ) -> Result<(), Box<dyn error::Error>> {
     let mymac = mac_address_by_name("tap0").unwrap().unwrap().bytes();
     let seq_num = tcp_header.sequence_number;
-
+    if *tcp.send.tx.subscribe().borrow_and_update() == Duration::from_secs(INFTIME) {
+        tcp.send
+            .tx
+            .send(Duration::from_millis(tcp.send.rto as u64))?;
+    }
     let builder = PacketBuilder::ethernet2(mymac, *src_mac)
         .ipv4(MYIP, srcip, 64)
         .tcp_header(tcp_header);
