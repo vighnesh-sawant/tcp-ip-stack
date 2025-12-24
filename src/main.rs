@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::error;
 use std::net::Ipv4Addr;
 use std::ops::DerefMut;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Instant;
 
 use dashmap::DashMap;
 
@@ -10,7 +11,7 @@ use etherparse::checksum::Sum16BitWords;
 use etherparse::{
     ArpHardwareId, ArpOperation, ArpPacket, ArpPacketSlice, EtherType, Ethernet2Slice,
     IcmpEchoHeader, Icmpv4Slice, Icmpv4Type, IpNumber, Ipv4Slice, PacketBuilder, TcpHeader,
-    TcpSlice,
+    TcpOptionElement, TcpSlice,
 };
 
 use mac_address::mac_address_by_name;
@@ -22,6 +23,8 @@ type MacAddr = [u8; 6];
 type Ip4Addr = [u8; 4];
 type Port = u16;
 const MYIP: [u8; 4] = [10, 0, 0, 4];
+
+static START_TIME: OnceLock<Instant> = OnceLock::new();
 
 #[allow(unused)] //this is for tx we dont use it yet but we need it
 #[derive(Copy, Clone, Debug)]
@@ -41,6 +44,9 @@ struct SendState {
     nxt: u32,
     una: u32,
     win: u16,
+    srtt: u16,
+    rttvar: u16,
+    rto: u16,
     buffer: BTreeMap<u32, Box<[u8]>>,
 }
 
@@ -62,6 +68,8 @@ fn main() {
     let mut tap = Tap::new_named(tap_name).unwrap();
     tap.add_addr(Ipv4Addr::new(10, 0, 0, 1)).unwrap();
     tap.set_up().unwrap();
+
+    START_TIME.get_or_init(Instant::now);
 
     let mut recv_buf = [0; 1514];
 
@@ -262,6 +270,9 @@ fn handle_tcp(
                     tcp.recv.win,
                 );
                 tcp_header.ack = true;
+
+                handle_timestamp_option(&packet, &mut tcp_header)?;
+
                 tcp_header.fin = true;
                 tcp_header.acknowledgment_number = tcp.recv.nxt;
                 tcp.send.nxt += payload.len() as u32;
@@ -295,11 +306,14 @@ fn tcp_send_ack(
     tcp_header.acknowledgment_number = tcp.recv.nxt;
     tcp.send.nxt += payload.len() as u32;
 
+    handle_timestamp_option(packet, &mut tcp_header)?;
+
     send_tcp(srcip, src_mac, tcp, tcp_header, payload, tap)?;
 
     println!("Received {:?}", packet.payload());
     Ok(())
 }
+
 fn handle_tcp_syn(
     packet: &TcpSlice,
     tcp_state: &mut Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>>,
@@ -318,6 +332,9 @@ fn handle_tcp_syn(
                 nxt: isn + 1,
                 una: isn,
                 win: packet.window_size(),
+                srtt: 0,
+                rttvar: 0,
+                rto: 1000,
                 buffer: BTreeMap::new(),
             },
             recv: RecvState {
@@ -342,9 +359,31 @@ fn handle_tcp_syn(
     tcp_header.ack = true;
     tcp_header.acknowledgment_number = packet.sequence_number() + 1;
 
+    handle_timestamp_option(packet, &mut tcp_header)?;
+
     let payload: &[u8] = &[];
     if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
         send_tcp(srcip, src_mac, tcp.value_mut(), tcp_header, payload, tap)?;
+    }
+    Ok(())
+}
+
+fn handle_timestamp_option(
+    packet: &TcpSlice,
+    tcp_header: &mut TcpHeader,
+) -> Result<(), Box<dyn error::Error>> {
+    for options in packet.options_iterator() {
+        if let TcpOptionElement::Timestamp(tsval, tsecr) = options.unwrap() {
+            let elements = [
+                TcpOptionElement::Noop,
+                TcpOptionElement::Noop,
+                TcpOptionElement::Timestamp(
+                    START_TIME.get_or_init(Instant::now).elapsed().as_millis() as u32,
+                    tsval,
+                ),
+            ];
+            tcp_header.set_options(&elements)?;
+        }
     }
     Ok(())
 }
