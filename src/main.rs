@@ -18,6 +18,7 @@ use etherparse::{
 use mac_address::mac_address_by_name;
 use rand::Rng;
 use tappers::{Interface, Tap};
+
 use tokio::sync::watch;
 use tokio::time::{self, Instant};
 
@@ -25,8 +26,8 @@ use tokio::time::{self, Instant};
 type MacAddr = [u8; 6];
 type Ip4Addr = [u8; 4];
 type Port = u16;
-const MYIP: [u8; 4] = [10, 0, 0, 4];
 
+const MYIP: [u8; 4] = [10, 0, 0, 4];
 const INFTIME: u64 = 365 * 24 * 3600;
 static TIMER: OnceLock<Instant> = OnceLock::new();
 
@@ -37,11 +38,20 @@ enum ClosingTcp {
     Tx,
     RxAndTx,
 }
+
 #[derive(Debug)]
 enum TcpStates {
     InProgress,
     Established,
     ClosingTcp(ClosingTcp),
+}
+
+struct PacketBeforeTcpHeader {
+    mymac: MacAddr,
+    src_mac: MacAddr,
+    srcip: Ip4Addr,
+    payload: Box<[u8]>,
+    tcp_header: TcpHeader,
 }
 
 struct SendState {
@@ -52,13 +62,13 @@ struct SendState {
     rttvar: u32,
     rto: u32,
     tx: watch::Sender<Duration>,
-    buffer: BTreeMap<u32, Box<[u8]>>,
+    buffer: BTreeMap<u32, PacketBeforeTcpHeader>,
 }
 
 struct RecvState {
     nxt: u32,
     win: u16,
-    buffer: BTreeMap<u32, [u8; 1514]>,
+    buffer: BTreeMap<u32, Box<[u8]>>,
 }
 
 struct TcpState {
@@ -68,7 +78,6 @@ struct TcpState {
 }
 
 //we have hardcoded window size currently
-
 #[tokio::main]
 async fn main() {
     let tap_name = Interface::new("tap0").unwrap();
@@ -76,12 +85,14 @@ async fn main() {
     tap_raw.add_addr(Ipv4Addr::new(10, 0, 0, 1)).unwrap();
     tap_raw.set_up().unwrap();
     let tap = Arc::new(Mutex::new(tap_raw));
+
     TIMER.get_or_init(Instant::now);
 
     let mut recv_buf = [0; 1514];
 
     let tcp_state: Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>> =
         Arc::new(RwLock::new(DashMap::new()));
+
     let arp_table: Arc<RwLock<DashMap<Ip4Addr, MacAddr>>> = Arc::new(RwLock::new(DashMap::new()));
 
     loop {
@@ -90,18 +101,16 @@ async fn main() {
             tap.recv(&mut recv_buf).unwrap();
         }
         let mut arp_table_arc = arp_table.clone();
-
         let mut tcp_state_arc = tcp_state.clone();
         let mut tap_arc = tap.clone();
-        tokio::spawn(async move {
-            handle_frame(
-                &recv_buf,
-                &mut arp_table_arc,
-                &mut tcp_state_arc,
-                &mut tap_arc,
-            )
-            .ok();
-        });
+
+        handle_frame(
+            &recv_buf,
+            &mut arp_table_arc,
+            &mut tcp_state_arc,
+            &mut tap_arc,
+        )
+        .ok();
     }
 }
 
@@ -218,24 +227,34 @@ fn handle_tcp(
     src_mac: &[u8; 6],
 ) -> Result<(), Box<dyn error::Error>> {
     let packet = TcpSlice::from_slice(buf)?;
+
     // the rfc tells we need to validate this rst so we need to do that
     if packet.rst() {
         let table = tcp_state.write().unwrap();
         table.remove(&(srcip, packet.source_port()));
         return Ok(());
     }
+
     if packet.syn() {
         handle_tcp_syn(&packet, tcp_state, tap, srcip, src_mac)?;
         return Ok(());
     }
 
+    let mut next_packet_buf: Option<Box<[u8]>> = None;
+
     let table = tcp_state.write().unwrap();
-    let mut next_packet_buf: Option<[u8; 1514]> = None;
     if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
         if packet.sequence_number() == tcp.recv.nxt {
             if packet.ack() {
                 tcp.send.una = packet.acknowledgment_number();
+
+                tcp.send.buffer = tcp.send.buffer.split_off(&packet.acknowledgment_number());
                 tcp.send.buffer.remove(&packet.acknowledgment_number());
+
+                tcp.send
+                    .tx
+                    .send(Duration::from_millis(tcp.send.rto as u64))?;
+
                 match tcp.state {
                     TcpStates::InProgress => tcp.state = TcpStates::Established,
                     TcpStates::ClosingTcp(ClosingTcp::RxAndTx) => {
@@ -246,12 +265,17 @@ fn handle_tcp(
                     _ => {}
                 }
             }
+
             if !packet.payload().is_empty() {
                 let payload: &[u8] = &[0x32, 0x34, 0x0a];
                 tcp_send_ack(&packet, tcp.value_mut(), tap, src_mac, srcip, payload)?;
             }
+
             let next = &tcp.recv.nxt.clone();
             next_packet_buf = tcp.recv.buffer.remove(next);
+            if next_packet_buf.is_none() {
+                tcp.send.tx.send(Duration::from_secs(INFTIME))?;
+            }
 
             //this does not handle overlaps currently
         } else if (packet.sequence_number() + packet.payload().len() as u32 - 1)
@@ -259,7 +283,7 @@ fn handle_tcp(
         {
             tcp.recv
                 .buffer
-                .insert(packet.sequence_number(), buf.try_into().unwrap());
+                .insert(packet.sequence_number(), Box::from(buf));
             let payload: &[u8] = &[];
             tcp_send_ack(&packet, tcp.value_mut(), tap, src_mac, srcip, payload)?;
         }
@@ -270,6 +294,7 @@ fn handle_tcp(
     if let Some(buff) = next_packet_buf {
         handle_tcp(&buff, tcp_state, tap, srcip, src_mac)?;
     }
+
     if packet.fin() {
         let table = tcp_state.write().unwrap();
         if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
@@ -286,6 +311,7 @@ fn handle_tcp(
 
                 _ => tcp.state = TcpStates::ClosingTcp(ClosingTcp::Rx),
             }
+
             if let TcpStates::ClosingTcp(ClosingTcp::Rx) = tcp.state {
                 let mut tcp_header = TcpHeader::new(
                     packet.destination_port(),
@@ -301,6 +327,7 @@ fn handle_tcp(
                 tcp_header.acknowledgment_number = tcp.recv.nxt;
                 tcp.send.nxt += payload.len() as u32;
                 tcp.state = TcpStates::ClosingTcp(ClosingTcp::RxAndTx);
+
                 send_tcp(srcip, src_mac, tcp.value_mut(), tcp_header, payload, tap)?;
             }
         } else {
@@ -353,23 +380,30 @@ fn handle_tcp_syn(
         watch::channel(Duration::from_secs(INFTIME));
 
     if !table.contains_key(&(srcip, packet.source_port())) {
+        let mut tcp_state_arc = tcp_state.clone();
+        let mut tap_arc = tap.clone();
+        let key = (srcip, packet.source_port());
+
         tokio::spawn(async move {
             let timer = time::sleep_until(Instant::now() + Duration::from_secs(INFTIME));
             let mut rto = Duration::from_secs(INFTIME);
             tokio::pin!(timer);
+
             loop {
                 tokio::select! {
-                    msg = rx.changed() => {
-                        if let Ok(()) = msg {
+                msg = rx.changed() => {
+                    if let Ok(()) = msg {
                         timer.as_mut().reset(Instant::now() + *rx.borrow_and_update());
-                            rto = *rx.borrow_and_update()
-                        }
+                        rto = *rx.borrow_and_update();
+                        println!("Rto {:}",rto.as_millis());
                     }
+                }
 
-                    _ = &mut timer => {
-                        println!("INTERRUPT: 5 seconds passed without a message!");
-                        rto *=2;
-                        timer.as_mut().reset(Instant::now() + rto);
+                _ = &mut timer => {
+                    rto *= 2;
+                    timer.as_mut().reset(Instant::now() +rto);
+                    handle_timer_rtx(&mut tcp_state_arc,&mut tap_arc,&key).unwrap();
+
                     }
                 }
             }
@@ -400,6 +434,7 @@ fn handle_tcp_syn(
 
     let mut tcp_header =
         TcpHeader::new(packet.destination_port(), packet.source_port(), isn, 64240);
+
     if packet.ack() {
         if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
             tcp.send.una = packet.acknowledgment_number();
@@ -410,6 +445,7 @@ fn handle_tcp_syn(
     } else {
         tcp_header.syn = true;
     }
+
     tcp_header.ack = true;
     tcp_header.acknowledgment_number = packet.sequence_number() + 1;
 
@@ -421,6 +457,48 @@ fn handle_tcp_syn(
     Ok(())
 }
 
+fn handle_timer_rtx(
+    tcp_state: &mut Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>>,
+    tap: &mut Arc<Mutex<tappers::Tap>>,
+    key: &(Ip4Addr, Port),
+) -> Result<(), Box<dyn error::Error>> {
+    let table = tcp_state.write().unwrap();
+    if let Some(tcp) = table.get_mut(key) {
+        if let Some(pair) = tcp.send.buffer.first_key_value() {
+            {
+                let mut tcp_header = pair.1.tcp_header.clone();
+                for options in pair.1.tcp_header.options.elements_iter() {
+                    if let TcpOptionElement::Timestamp(_tsval, tsecr) = options.unwrap() {
+                        let curr_time =
+                            TIMER.get_or_init(Instant::now).elapsed().as_millis() as u32;
+
+                        let elements = [
+                            TcpOptionElement::Noop,
+                            TcpOptionElement::Noop,
+                            TcpOptionElement::Timestamp(curr_time, tsecr),
+                        ];
+
+                        tcp_header.set_options(&elements)?;
+                    }
+                }
+                let builder = PacketBuilder::ethernet2(pair.1.mymac, pair.1.src_mac)
+                    .ipv4(MYIP, pair.1.srcip, 64)
+                    .tcp_header(tcp_header);
+                let payload = &*pair.1.payload;
+                let mut result = Vec::<u8>::with_capacity(builder.size(payload.len()));
+                builder.write(&mut result, payload)?;
+                {
+                    let tap = tap.lock().unwrap();
+                    tap.send(&result)?;
+                }
+            }
+        } else {
+            tcp.send.tx.send(Duration::from_secs(INFTIME))?;
+        }
+    }
+
+    Ok(())
+}
 fn handle_timestamp_option(
     packet: &TcpSlice,
     tcp_header: &mut TcpHeader,
@@ -429,14 +507,18 @@ fn handle_timestamp_option(
     for options in packet.options_iterator() {
         if let TcpOptionElement::Timestamp(tsval, tsecr) = options.unwrap() {
             let curr_time = TIMER.get_or_init(Instant::now).elapsed().as_millis() as u32;
+
             let elements = [
                 TcpOptionElement::Noop,
                 TcpOptionElement::Noop,
                 TcpOptionElement::Timestamp(curr_time, tsval),
             ];
             tcp_header.set_options(&elements)?;
+
             if tsecr != 0 {
                 let r = curr_time - tsecr;
+
+                println!("RTT {:?}", r);
                 if r > 0 {
                     if tcp.send.srtt == 0 {
                         tcp.send.srtt = r;
@@ -468,19 +550,30 @@ fn send_tcp(
 ) -> Result<(), Box<dyn error::Error>> {
     let mymac = mac_address_by_name("tap0").unwrap().unwrap().bytes();
     let seq_num = tcp_header.sequence_number;
+
     if *tcp.send.tx.subscribe().borrow_and_update() == Duration::from_secs(INFTIME) {
         tcp.send
             .tx
             .send(Duration::from_millis(tcp.send.rto as u64))?;
     }
+
     let builder = PacketBuilder::ethernet2(mymac, *src_mac)
         .ipv4(MYIP, srcip, 64)
-        .tcp_header(tcp_header);
+        .tcp_header(tcp_header.clone());
     let mut result = Vec::<u8>::with_capacity(builder.size(payload.len()));
     builder.write(&mut result, payload)?;
-    tcp.send
-        .buffer
-        .insert(seq_num + payload.len() as u32, Box::from(result.as_slice()));
+
+    tcp.send.buffer.insert(
+        seq_num + payload.len() as u32,
+        PacketBeforeTcpHeader {
+            mymac,
+            src_mac: *src_mac,
+            srcip,
+            payload: Box::from(payload),
+            tcp_header,
+        },
+    );
+
     //i think this not exactly according to rfc but think this will give better performance?
     if tcp.send.una + tcp.send.win as u32 >= seq_num {
         {
