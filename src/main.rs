@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::error;
 use std::net::Ipv4Addr;
 use std::ops::DerefMut;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -72,22 +72,36 @@ struct TcpState {
 #[tokio::main]
 async fn main() {
     let tap_name = Interface::new("tap0").unwrap();
-    let mut tap = Tap::new_named(tap_name).unwrap();
-    tap.add_addr(Ipv4Addr::new(10, 0, 0, 1)).unwrap();
-    tap.set_up().unwrap();
-
+    let mut tap_raw = Tap::new_named(tap_name).unwrap();
+    tap_raw.add_addr(Ipv4Addr::new(10, 0, 0, 1)).unwrap();
+    tap_raw.set_up().unwrap();
+    let tap = Arc::new(Mutex::new(tap_raw));
     TIMER.get_or_init(Instant::now);
 
     let mut recv_buf = [0; 1514];
 
-    let mut tcp_state: Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>> =
+    let tcp_state: Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>> =
         Arc::new(RwLock::new(DashMap::new()));
-    let mut arp_table: Arc<RwLock<DashMap<Ip4Addr, MacAddr>>> =
-        Arc::new(RwLock::new(DashMap::new()));
+    let arp_table: Arc<RwLock<DashMap<Ip4Addr, MacAddr>>> = Arc::new(RwLock::new(DashMap::new()));
 
     loop {
-        tap.recv(&mut recv_buf).unwrap();
-        handle_frame(&recv_buf, &mut arp_table, &mut tcp_state, &mut tap).ok();
+        {
+            let tap = tap.lock().unwrap();
+            tap.recv(&mut recv_buf).unwrap();
+        }
+        let mut arp_table_arc = arp_table.clone();
+
+        let mut tcp_state_arc = tcp_state.clone();
+        let mut tap_arc = tap.clone();
+        tokio::spawn(async move {
+            handle_frame(
+                &recv_buf,
+                &mut arp_table_arc,
+                &mut tcp_state_arc,
+                &mut tap_arc,
+            )
+            .ok();
+        });
     }
 }
 
@@ -95,7 +109,7 @@ fn handle_frame(
     buf: &[u8],
     arp_table: &mut Arc<RwLock<DashMap<Ip4Addr, MacAddr>>>,
     tcp_state: &mut Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>>,
-    tap: &mut Tap,
+    tap: &mut Arc<Mutex<tappers::Tap>>,
 ) -> Result<(), Box<dyn error::Error>> {
     let frame = Ethernet2Slice::from_slice_without_fcs(buf)?;
 
@@ -111,7 +125,7 @@ fn handle_frame(
 fn handle_arp(
     buf: &[u8],
     arp_table: &mut Arc<RwLock<DashMap<Ip4Addr, MacAddr>>>,
-    tap: &mut Tap,
+    tap: &mut Arc<Mutex<tappers::Tap>>,
 ) -> Result<(), Box<dyn error::Error>> {
     let packet = ArpPacketSlice::from_slice(buf)?;
 
@@ -147,7 +161,10 @@ fn handle_arp(
                     let mut result = Vec::<u8>::with_capacity(builder.size());
                     builder.write(&mut result)?;
 
-                    tap.send(&result)?;
+                    {
+                        let tap = tap.lock().unwrap();
+                        tap.send(&result)?;
+                    }
                 }
             }
         }
@@ -158,7 +175,7 @@ fn handle_arp(
 fn handle_ipv4(
     buf: &[u8],
     tcp_state: &mut Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>>,
-    tap: &mut Tap,
+    tap: &mut Arc<Mutex<tappers::Tap>>,
     src_mac: &[u8; 6],
 ) -> Result<(), Box<dyn error::Error>> {
     let packet = Ipv4Slice::from_slice(buf)?;
@@ -196,7 +213,7 @@ fn handle_ipv4(
 fn handle_tcp(
     buf: &[u8],
     tcp_state: &mut Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>>,
-    tap: &mut Tap,
+    tap: &mut Arc<Mutex<tappers::Tap>>,
     srcip: [u8; 4],
     src_mac: &[u8; 6],
 ) -> Result<(), Box<dyn error::Error>> {
@@ -297,7 +314,7 @@ fn handle_tcp(
 fn tcp_send_ack(
     packet: &TcpSlice,
     tcp: &mut TcpState,
-    tap: &mut Tap,
+    tap: &mut Arc<Mutex<tappers::Tap>>,
     src_mac: &[u8; 6],
     srcip: [u8; 4],
     payload: &[u8],
@@ -324,7 +341,7 @@ fn tcp_send_ack(
 fn handle_tcp_syn(
     packet: &TcpSlice,
     tcp_state: &mut Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>>,
-    tap: &mut Tap,
+    tap: &mut Arc<Mutex<tappers::Tap>>,
     srcip: [u8; 4],
     src_mac: &[u8; 6],
 ) -> Result<(), Box<dyn error::Error>> {
@@ -338,17 +355,21 @@ fn handle_tcp_syn(
     if !table.contains_key(&(srcip, packet.source_port())) {
         tokio::spawn(async move {
             let timer = time::sleep_until(Instant::now() + Duration::from_secs(INFTIME));
+            let mut rto = Duration::from_secs(INFTIME);
             tokio::pin!(timer);
             loop {
                 tokio::select! {
                     msg = rx.changed() => {
                         if let Ok(()) = msg {
                         timer.as_mut().reset(Instant::now() + *rx.borrow_and_update());
+                            rto = *rx.borrow_and_update()
                         }
                     }
 
                     _ = &mut timer => {
                         println!("INTERRUPT: 5 seconds passed without a message!");
+                        rto *=2;
+                        timer.as_mut().reset(Instant::now() + rto);
                     }
                 }
             }
@@ -443,7 +464,7 @@ fn send_tcp(
     tcp: &mut TcpState,
     tcp_header: TcpHeader,
     payload: &[u8],
-    tap: &mut Tap,
+    tap: &mut Arc<Mutex<tappers::Tap>>,
 ) -> Result<(), Box<dyn error::Error>> {
     let mymac = mac_address_by_name("tap0").unwrap().unwrap().bytes();
     let seq_num = tcp_header.sequence_number;
@@ -462,7 +483,10 @@ fn send_tcp(
         .insert(seq_num + payload.len() as u32, Box::from(result.as_slice()));
     //i think this not exactly according to rfc but think this will give better performance?
     if tcp.send.una + tcp.send.win as u32 >= seq_num {
-        tap.send(&result)?;
+        {
+            let tap = tap.lock().unwrap();
+            tap.send(&result)?;
+        }
     }
 
     Ok(())
@@ -470,7 +494,7 @@ fn send_tcp(
 
 fn handle_icmpv4(
     buf: &[u8],
-    tap: &mut Tap,
+    tap: &mut Arc<Mutex<tappers::Tap>>,
     srcip: [u8; 4],
     src_mac: &[u8; 6],
 ) -> Result<(), Box<dyn error::Error>> {
@@ -489,7 +513,7 @@ fn handle_icmpv4(
 fn handle_icmpv4_echo_request(
     header: IcmpEchoHeader,
     payload: &[u8],
-    tap: &mut Tap,
+    tap: &mut Arc<Mutex<tappers::Tap>>,
     srcip: [u8; 4],
     src_mac: &[u8; 6],
 ) -> Result<(), Box<dyn error::Error>> {
@@ -501,7 +525,10 @@ fn handle_icmpv4_echo_request(
     let mut result = Vec::<u8>::with_capacity(builder.size(payload.len()));
     builder.write(&mut result, payload)?;
 
-    tap.send(&result)?;
+    {
+        let tap = tap.lock().unwrap();
+        tap.send(&result)?;
+    }
 
     Ok(())
 }
