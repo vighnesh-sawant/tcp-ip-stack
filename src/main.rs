@@ -57,10 +57,12 @@ struct PacketBeforeTcpHeader {
 struct SendState {
     nxt: u32,
     una: u32,
-    win: u16,
+    win: u32,
     srtt: u32,
     rttvar: u32,
     rto: u32,
+    ssthresh: u32,
+    dupack: u16,
     tx: watch::Sender<Duration>,
     buffer: BTreeMap<u32, PacketBeforeTcpHeader>,
 }
@@ -246,6 +248,34 @@ fn handle_tcp(
     if let Some(mut tcp) = table.get_mut(&(srcip, packet.source_port())) {
         if packet.sequence_number() == tcp.recv.nxt {
             if packet.ack() {
+                if tcp.send.una == packet.acknowledgment_number() {
+                    tcp.send.dupack += 1;
+                    if tcp.send.dupack >= 3 {
+                        tcp.send.ssthresh =
+                            max(((tcp.send.buffer.values().count() * 1500) / 2) as u32, 3000);
+                        tcp.send.win = tcp.send.ssthresh + 4500;
+                    }
+
+                    tcp.send.tx.send(Duration::from_nanos(1))?;
+                } else {
+                    #[allow(clippy::collapsible_else_if)] // why does clippy want to make my code
+                    // bad?????
+                    if tcp.send.win <= tcp.send.ssthresh {
+                        if let Some(v) = packet.acknowledgment_number().checked_sub(tcp.send.una) {
+                            tcp.send.win += v;
+                        }
+                    } else {
+                        if let Some(value) = tcp.send.win.checked_add(1500 * 1500 / tcp.send.win) {
+                            tcp.send.win = value;
+                        } else {
+                            tcp.send.win = u32::MAX;
+                        }
+                    }
+                    if tcp.send.dupack >= 3 {
+                        tcp.send.dupack = 0;
+                        tcp.send.win = tcp.send.ssthresh;
+                    }
+                }
                 tcp.send.una = packet.acknowledgment_number();
 
                 tcp.send.buffer = tcp.send.buffer.split_off(&packet.acknowledgment_number());
@@ -400,9 +430,13 @@ fn handle_tcp_syn(
                 }
 
                 _ = &mut timer => {
+                    let mut adjust_ssthresh = false;
+                    if rto == *rx.borrow_and_update() {
+                       adjust_ssthresh = true;
+                    }
                     rto *= 2;
                     timer.as_mut().reset(Instant::now() +rto);
-                    handle_timer_rtx(&mut tcp_state_arc,&mut tap_arc,&key).unwrap();
+                    handle_timer_rtx(&mut tcp_state_arc,&mut tap_arc,&key,&adjust_ssthresh).unwrap();
 
                     }
                 }
@@ -417,10 +451,12 @@ fn handle_tcp_syn(
             send: SendState {
                 nxt: isn + 1,
                 una: isn,
-                win: packet.window_size(),
+                win: 4400,
                 srtt: 0,
                 rttvar: 0,
                 rto: 1000,
+                ssthresh: packet.window_size() as u32,
+                dupack: 0,
                 tx,
                 buffer: BTreeMap::new(),
             },
@@ -461,9 +497,10 @@ fn handle_timer_rtx(
     tcp_state: &mut Arc<RwLock<DashMap<(Ip4Addr, Port), TcpState>>>,
     tap: &mut Arc<Mutex<tappers::Tap>>,
     key: &(Ip4Addr, Port),
+    adjust_ssthresh: &bool,
 ) -> Result<(), Box<dyn error::Error>> {
     let table = tcp_state.write().unwrap();
-    if let Some(tcp) = table.get_mut(key) {
+    if let Some(mut tcp) = table.get_mut(key) {
         if let Some(pair) = tcp.send.buffer.first_key_value() {
             {
                 let mut tcp_header = pair.1.tcp_header.clone();
@@ -487,6 +524,13 @@ fn handle_timer_rtx(
                 let payload = &*pair.1.payload;
                 let mut result = Vec::<u8>::with_capacity(builder.size(payload.len()));
                 builder.write(&mut result, payload)?;
+
+                if *adjust_ssthresh {
+                    tcp.send.win = 1500;
+                    tcp.send.ssthresh =
+                        max(((tcp.send.buffer.values().count() * 1500) / 2) as u32, 3000);
+                }
+
                 {
                     let tap = tap.lock().unwrap();
                     tap.send(&result)?;
@@ -575,7 +619,7 @@ fn send_tcp(
     );
 
     //i think this not exactly according to rfc but think this will give better performance?
-    if tcp.send.una + tcp.send.win as u32 >= seq_num {
+    if tcp.send.una + tcp.send.win >= seq_num {
         {
             let tap = tap.lock().unwrap();
             tap.send(&result)?;
